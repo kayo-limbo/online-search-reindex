@@ -69,6 +69,8 @@ flowchart LR
 
 ## 验收标准
 
+基线入口：`python tests/baseline/stale_snapshot.py`（Python 3、Docker Compose）。使用独立的临时环境；测试通过代表成功观察到错误，不代表正式迁移流程已修复。
+
 ### 主线验收
 
 | 场景 | 可复现操作 | 通过条件 |
