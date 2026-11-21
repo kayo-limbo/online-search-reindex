@@ -57,6 +57,9 @@ public final class ReplayWorker {
             result.next();
             boolean switched = result.getBoolean(1);
             if (switched) {
+                try (var init = query("INSERT INTO active_sync(target, confirmed_seq) VALUES (?, ?)", target, confirmed)) {
+                    init.executeUpdate();
+                }
                 try (var finish = query("UPDATE replay_job SET status='complete' WHERE target=? AND status='running'", target)) {
                     if (finish.executeUpdate() != 1) throw new SQLException("Lost replay job");
                 }
@@ -187,12 +190,50 @@ public final class ReplayWorker {
         }
     }
 
+    private boolean syncNext() throws Exception {
+        String target;
+        long seq;
+        String operation;
+        String id;
+        String payload;
+        try (var claim = query("""
+                UPDATE active_sync AS progress SET pending_seq=event.seq
+                FROM index_control AS pointer, document_changes AS event
+                WHERE progress.target=pointer.active AND progress.pending_seq IS NULL
+                  AND event.seq=progress.confirmed_seq+1
+                RETURNING progress.target,event.seq,event.operation,event.document_id,event.payload
+                """); var row = claim.executeQuery()) {
+            if (!row.next()) return false;
+            target = row.getString(1);
+            seq = row.getLong(2);
+            operation = row.getString(3);
+            id = row.getString(4);
+            payload = row.getString(5);
+        }
+        try {
+            apply(target, operation, id, payload);
+            try (var save = query("UPDATE active_sync SET confirmed_seq=?,pending_seq=NULL WHERE target=? AND pending_seq=?",
+                    seq, target, seq)) {
+                if (save.executeUpdate() != 1) throw new SQLException("Lost active checkpoint");
+            }
+        } catch (Exception failure) {
+            try (var mark = query("UPDATE active_sync SET failure=? WHERE target=? AND pending_seq=?",
+                    failure.toString(), target, seq)) { mark.executeUpdate(); }
+            throw failure;
+        }
+        return true;
+    }
+
     public static void main(String[] args) throws Exception {
         boolean rebuild = args.length == 2 && args[0].equals("rebuild");
         if (!rebuild && args.length != 1) throw new IllegalArgumentException("Expected [rebuild] target");
         try (var db = DriverManager.getConnection(required("JDBC_URL"), required("PGUSER"), required("PGPASSWORD"))) {
             var worker = new ReplayWorker(db);
-            if (rebuild) worker.rebuild(args[1]);
+            if (args.length == 1 && args[0].equals("sync")) {
+                while (!Thread.currentThread().isInterrupted()) {
+                    if (!worker.syncNext()) Thread.sleep(200);
+                }
+            } else if (rebuild) worker.rebuild(args[1]);
             else worker.run(args[0]);
         }
     }

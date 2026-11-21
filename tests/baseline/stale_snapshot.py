@@ -92,13 +92,49 @@ class StaleSnapshotTest(unittest.TestCase):
         return self.invoke_worker("docs_v2")
 
     def invoke_worker(self, *args):
+        with self.start_worker(*args) as process:
+            try:
+                stdout, stderr = process.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                raise
+            return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+
+    def start_worker(self, *args):
         postgres = self.compose("port", "postgres", "5432")
         jar = Path(__file__).resolve().parents[2] / "backend/target/replay-worker-0.1.0.jar"
-        return subprocess.run(["java", "-cp", str(jar), "dev.reindex.ReplayWorker", *args],
+        return subprocess.Popen(["java", "-cp", str(jar), "dev.reindex.ReplayWorker", *args],
                               env={**os.environ, "JDBC_URL": f"jdbc:postgresql://{postgres}/postgres",
                                    "PGUSER": "postgres", "PGPASSWORD": "baseline-only",
                                    "TYPESENSE_URL": self.url, "TYPESENSE_API_KEY": "baseline-only"},
-                              capture_output=True, text=True, timeout=60)
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def test_sync_follows_cutover(self):
+        self.migrate()
+        self.api("POST", "/collections", {"name": "docs_v1", "fields": [{"name": "title", "type": "string"}]})
+        with self.start_worker("sync") as process:
+            def wait_for(target, seq):
+                deadline = time.monotonic() + 20
+                while self.sql(f"SELECT confirmed_seq FROM active_sync WHERE target='{target}'") != str(seq):
+                    if process.poll() is not None:
+                        self.fail(process.stderr.read())
+                    if time.monotonic() > deadline:
+                        self.fail(f"{target} did not confirm {seq}")
+                    time.sleep(0.1)
+            try:
+                self.sql("SELECT put_document('42', 'notice', 'old', 'news')")
+                wait_for("docs_v1", 1)
+                result = self.invoke_worker("rebuild", "docs_v2")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.sql("SELECT active FROM index_control"), "docs_v2")
+                self.sql("SELECT delete_document('42')")
+                self.sql("SELECT put_document('43', 'notice', 'new', 'news')")
+                wait_for("docs_v2", 3)
+                self.assertEqual(self.active_hits(), ["43"])
+                self.assertEqual(self.api("GET", "/collections/docs_v1/documents/42")["id"], "42")
+                wait_for("docs_v1", 1)
+            finally:
+                process.terminate()
 
     def test_rebuild_catches_commit_at_cutover(self):
         self.migrate()
