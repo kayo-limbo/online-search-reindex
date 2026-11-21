@@ -71,6 +71,8 @@ flowchart LR
 
 基线入口：`python tests/baseline/stale_snapshot.py`（Python 3、Docker Compose）。使用独立的临时环境；测试通过代表成功观察到错误，不代表正式迁移流程已修复。
 
+写入事务入口：`python tests/baseline/test_document_changes.py`。已在 PostgreSQL 17 Alpine 上验证新增、修改、删除及重复删除，并通过变更日志约束注入失败，确认文档、日志和已提交序号同时回滚。此项只验证数据库写入，不覆盖搜索切换。
+
 ### 主线验收
 
 | 场景 | 可复现操作 | 通过条件 |
