@@ -1,10 +1,10 @@
 import json
+import os
 import subprocess
 import time
 import unittest
 import uuid
 from pathlib import Path
-from urllib.parse import quote
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -82,25 +82,44 @@ class StaleSnapshotTest(unittest.TestCase):
         self.sql("UPDATE index_control SET active='docs_v2'")
         self.assertCountEqual(self.active_hits(), ["42", "43"])
 
+    def run_worker(self, confirmed):
+        self.sql("INSERT INTO replay_job(source, target, confirmed_seq) "
+                 f"VALUES ('docs_v1', 'docs_v2', {confirmed})")
+        postgres = self.compose("port", "postgres", "5432")
+        jar = Path(__file__).resolve().parents[2] / "backend/target/replay-worker-0.1.0.jar"
+        return subprocess.run(["java", "-cp", str(jar), "dev.reindex.ReplayWorker", "docs_v2"],
+                              env={**os.environ, "JDBC_URL": f"jdbc:postgresql://{postgres}/postgres",
+                                   "PGUSER": "postgres", "PGPASSWORD": "baseline-only",
+                                   "TYPESENSE_URL": self.url, "TYPESENSE_API_KEY": "baseline-only"},
+                              capture_output=True, text=True, timeout=60)
+
     def test_replay_before_cutover_preserves_deletion(self):
         confirmed = self.import_snapshot_then_delete()
-        def cutover():
-            return self.sql(f"SELECT try_cutover('docs_v1', 'docs_v2', {confirmed})")
-
-        self.assertEqual(cutover(), "f")
-        self.assertEqual(self.sql("SELECT active FROM index_control"), "docs_v1")
-        changes = self.sql(f"SELECT row_to_json(document_changes) FROM document_changes "
-                           f"WHERE seq > {confirmed} ORDER BY seq")
-        for line in changes.splitlines():
-            event = json.loads(line)
-            self.assertEqual(event["seq"], confirmed + 1)
-            self.assertEqual(event["operation"], "delete")
-            removed = self.api("DELETE", "/collections/docs_v2/documents/" +
-                               quote(event["document_id"], safe=""))
-            self.assertEqual(removed["id"], event["document_id"])
-            confirmed = event["seq"]
-        self.assertEqual(cutover(), "t")
+        self.assertEqual(self.sql(f"SELECT try_cutover('docs_v1', 'docs_v2', {confirmed})"), "f")
+        result = self.run_worker(confirmed)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sql("SELECT status, confirmed_seq FROM replay_job"), "complete|3")
         self.assertEqual(self.sql("SELECT active FROM index_control"), "docs_v2")
+        self.assertEqual(self.active_hits(), ["43"])
+
+    def test_worker_replays_insert_and_edit(self):
+        confirmed = self.import_snapshot_then_delete()
+        self.sql("SELECT put_document('44', 'notice', 'new', 'news')")
+        self.sql("SELECT put_document('43', 'archived', 'edited', 'other')")
+        result = self.run_worker(confirmed)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.active_hits(), ["44"])
+        self.assertEqual(self.api("GET", "/collections/docs_v2/documents/43")["body"], "edited")
+        self.assertEqual(self.sql("SELECT status, confirmed_seq FROM replay_job"), "complete|5")
+
+    def test_failed_request_does_not_cut_over(self):
+        confirmed = self.import_snapshot_then_delete()
+        self.api("DELETE", "/collections/docs_v2")
+        result = self.run_worker(confirmed)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sql("SELECT status, confirmed_seq, failure LIKE '%HTTP 404%' FROM replay_job"),
+                         "failed|2|t")
+        self.assertEqual(self.sql("SELECT active FROM index_control"), "docs_v1")
         self.assertEqual(self.active_hits(), ["43"])
 
 

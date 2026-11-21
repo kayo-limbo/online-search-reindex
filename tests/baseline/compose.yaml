@@ -1,6 +1,8 @@
 services:
   postgres:
     image: ${POSTGRES_TEST_IMAGE:-postgres:16-alpine}
+    ports:
+      - "127.0.0.1::5432"
     environment:
       POSTGRES_PASSWORD: baseline-only
     healthcheck:

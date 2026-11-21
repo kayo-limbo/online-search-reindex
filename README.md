@@ -69,7 +69,7 @@ flowchart LR
 
 ## 验收标准
 
-切换对照入口：`python tests/baseline/stale_snapshot.py`（Python 3、Docker Compose）。已用 PostgreSQL 17 Alpine 与 Typesense 29.0 跑通两组用例：快照后删除公告 42，直接切换会搜到 42、43；仅确认到快照序号时切换被拒绝，重放并确认删除后切换只搜到 43。当前由测试驱动重放，尚未验收后台执行器或持续并发写入。
+切换对照入口：先用 JDK 21+ 运行 `mvn -f backend/pom.xml package`，再运行 `python tests/baseline/stale_snapshot.py`（Python 3、Docker Compose）。PostgreSQL 17 Alpine、Typesense 29.0 上四例通过：直接切换重现已删除的公告；Java 执行器重放删除后只返回保留的公告；新增与修改按序生效；目标索引不存在时记录失败，不推进确认序号或切换指针。当前测试仍负责准备和导入快照，执行器只接手已完成导入的任务；持续并发写入与重启恢复尚未验收。
 
 写入事务入口：`python tests/baseline/test_document_changes.py`。已在 PostgreSQL 17 Alpine 上验证新增、修改、删除及重复删除，并通过变更日志约束注入失败，确认文档、日志和已提交序号同时回滚。此项只验证数据库写入，不覆盖搜索切换。
 
