@@ -4,6 +4,7 @@ import subprocess
 import time
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -50,10 +51,13 @@ class StaleSnapshotTest(unittest.TestCase):
         results = self.api("GET", f"/collections/{active}/documents/search?q=notice&query_by=title")
         return [hit["document"]["id"] for hit in results["hits"]]
 
-    def import_snapshot_then_delete(self):
+    def migrate(self):
         migrations = Path(__file__).resolve().parents[2] / "backend/src/main/resources/db"
         for migration in sorted(migrations.glob("*.sql")):
             self.sql(migration.read_text(encoding="utf-8"))
+
+    def import_snapshot_then_delete(self):
+        self.migrate()
         self.sql("SELECT put_document('42', 'notice', 'expired', 'news')")
         self.sql("SELECT put_document('43', 'notice', 'keep', 'news')")
         for version in ("docs_v1", "docs_v2"):
@@ -85,13 +89,49 @@ class StaleSnapshotTest(unittest.TestCase):
     def run_worker(self, confirmed):
         self.sql("INSERT INTO replay_job(source, target, confirmed_seq) "
                  f"VALUES ('docs_v1', 'docs_v2', {confirmed})")
+        return self.invoke_worker("docs_v2")
+
+    def invoke_worker(self, *args):
         postgres = self.compose("port", "postgres", "5432")
         jar = Path(__file__).resolve().parents[2] / "backend/target/replay-worker-0.1.0.jar"
-        return subprocess.run(["java", "-cp", str(jar), "dev.reindex.ReplayWorker", "docs_v2"],
+        return subprocess.run(["java", "-cp", str(jar), "dev.reindex.ReplayWorker", *args],
                               env={**os.environ, "JDBC_URL": f"jdbc:postgresql://{postgres}/postgres",
                                    "PGUSER": "postgres", "PGPASSWORD": "baseline-only",
                                    "TYPESENSE_URL": self.url, "TYPESENSE_API_KEY": "baseline-only"},
                               capture_output=True, text=True, timeout=60)
+
+    def test_rebuild_catches_commit_at_cutover(self):
+        self.migrate()
+        self.sql("SELECT put_document(number::text, 'notice', 'body', 'news') FROM generate_series(1,129) number")
+        writer = subprocess.Popen(
+            ["docker", "compose", "-f", str(Path(__file__).with_name("compose.yaml")), "-p", self.project,
+             "exec", "-T", "postgres", "psql", "-XAtq", "-U", "postgres", "-v", "ON_ERROR_STOP=1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        with writer, ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                writer.stdin.write("BEGIN; SELECT delete_document('42');\n")
+                writer.stdin.flush()
+                self.assertEqual(writer.stdout.readline().strip(), "130")
+                pending = pool.submit(self.invoke_worker, "rebuild", "docs_v2")
+                deadline = time.monotonic() + 30
+                while self.sql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' "
+                               "AND query LIKE 'SELECT try_cutover(%'") != "1":
+                    if pending.done():
+                        self.fail(pending.result().stderr)
+                    if time.monotonic() > deadline:
+                        self.fail("Worker did not reach the cutover lock")
+                self.assertEqual(self.sql("SELECT active FROM index_control"), "docs_v1")
+                self.assertEqual(self.api("GET", "/collections/docs_v2/documents/42")["id"], "42")
+                writer.stdin.write("COMMIT;\n")
+            finally:
+                writer.stdin.close()
+            result = pending.result()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sql("SELECT status, confirmed_seq FROM replay_job"), "complete|130")
+        self.assertEqual(self.sql("SELECT active FROM index_control"), "docs_v2")
+        hits = self.api("GET", "/collections/docs_v2/documents/search?q=*&filter_by=category:news&per_page=200")
+        self.assertCountEqual([hit["document"]["id"] for hit in hits["hits"]],
+                              self.sql("SELECT id FROM documents").splitlines())
 
     def test_replay_before_cutover_preserves_deletion(self):
         confirmed = self.import_snapshot_then_delete()

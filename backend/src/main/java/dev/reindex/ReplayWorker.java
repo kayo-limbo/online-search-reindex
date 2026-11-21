@@ -7,6 +7,9 @@ import java.net.http.*;
 import java.nio.charset.StandardCharsets;
 import java.sql.*;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 
 public final class ReplayWorker {
     private final Connection db;
@@ -68,6 +71,79 @@ public final class ReplayWorker {
         }
     }
 
+    private void rebuild(String target) throws Exception {
+        db.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+        db.setAutoCommit(false);
+        String source;
+        long boundary;
+        try {
+            try (var select = query("SELECT active, committed_seq FROM index_control"); var row = select.executeQuery()) {
+                row.next();
+                source = row.getString(1);
+                boundary = row.getLong(2);
+            }
+            try (var job = query("INSERT INTO replay_job(target, source, confirmed_seq, status) VALUES (?, ?, 0, 'running')",
+                    target, source); var snapshot = query("CREATE TEMP TABLE rebuild_snapshot AS SELECT id, to_jsonb(documents)::text AS payload FROM documents");
+                 var index = query("CREATE UNIQUE INDEX ON rebuild_snapshot(id)")) {
+                job.executeUpdate();
+                snapshot.execute();
+                index.execute();
+            }
+            db.commit();
+        } catch (SQLException failure) {
+            db.rollback();
+            throw failure;
+        } finally {
+            db.setAutoCommit(true);
+            db.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
+        }
+        try {
+            importSnapshot(target);
+            try (var save = query("UPDATE replay_job SET confirmed_seq=? WHERE target=?", boundary, target)) {
+                save.executeUpdate();
+            }
+        } catch (Exception failure) {
+            recordFailure(target, failure);
+            throw failure;
+        }
+        replay(target, source, boundary);
+    }
+
+    private String post(String path, String type, String body) throws Exception {
+        var request = HttpRequest.newBuilder(URI.create(endpoint + path)).timeout(Duration.ofSeconds(30))
+                .header("X-TYPESENSE-API-KEY", key).header("Content-Type", type)
+                .POST(HttpRequest.BodyPublishers.ofString(body)).build();
+        var response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() / 100 != 2) throw new IllegalStateException(path + ": HTTP " + response.statusCode());
+        return response.body();
+    }
+
+    private void importSnapshot(String target) throws Exception {
+        var schema = Map.of("name", target, "fields", List.of(Map.of("name", "title", "type", "string"),
+                Map.of("name", "body", "type", "string"), Map.of("name", "category", "type", "string", "facet", true)));
+        post("/collections", "application/json", json.writeValueAsString(schema));
+        String cursor = null;
+        while (true) {
+            var documents = new ArrayList<String>();
+            try (var page = query("SELECT id, payload FROM rebuild_snapshot WHERE (?::text IS NULL OR id > ?) ORDER BY id LIMIT 128",
+                    cursor, cursor); var rows = page.executeQuery()) {
+                while (rows.next()) {
+                    cursor = rows.getString(1);
+                    documents.add(rows.getString(2));
+                }
+            }
+            if (documents.isEmpty()) return;
+            var results = post("/collections/" + segment(target) + "/documents/import?action=create",
+                    "text/plain", String.join("\n", documents)).lines().toList();
+            if (results.size() != documents.size()) throw new IllegalStateException("Incomplete snapshot batch");
+            for (String result : results) {
+                var entry = json.readTree(result);
+                if (!entry.path("success").asBoolean(false))
+                    throw new IllegalStateException("Snapshot import failed: " + entry.path("error").asText());
+            }
+        }
+    }
+
     private void run(String target) throws Exception {
         String source;
         long confirmed;
@@ -78,6 +154,15 @@ public final class ReplayWorker {
             source = job.getString(1);
             confirmed = job.getLong(2);
         }
+        replay(target, source, confirmed);
+    }
+
+    private void recordFailure(String target, Exception failure) throws SQLException {
+        try (var fail = query("UPDATE replay_job SET status='failed', failure=? WHERE target=? AND status='running'",
+                failure.toString(), target)) { fail.executeUpdate(); }
+    }
+
+    private void replay(String target, String source, long confirmed) throws Exception {
         try {
             for (int batch = 0; batch < 1000; batch++) {
                 try (var read = query("SELECT seq, operation, document_id, payload FROM document_changes "
@@ -97,16 +182,18 @@ public final class ReplayWorker {
             }
             throw new IllegalStateException("Replay did not catch up within batch limit");
         } catch (Exception failure) {
-            try (var fail = query("UPDATE replay_job SET status='failed', failure=? WHERE target=? AND status='running'",
-                    failure.toString(), target)) { fail.executeUpdate(); }
+            recordFailure(target, failure);
             throw failure;
         }
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 1) throw new IllegalArgumentException("Expected target collection");
+        boolean rebuild = args.length == 2 && args[0].equals("rebuild");
+        if (!rebuild && args.length != 1) throw new IllegalArgumentException("Expected [rebuild] target");
         try (var db = DriverManager.getConnection(required("JDBC_URL"), required("PGUSER"), required("PGPASSWORD"))) {
-            new ReplayWorker(db).run(args[0]);
+            var worker = new ReplayWorker(db);
+            if (rebuild) worker.rebuild(args[1]);
+            else worker.run(args[0]);
         }
     }
 }
